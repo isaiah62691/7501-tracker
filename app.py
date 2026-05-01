@@ -42,141 +42,122 @@ COUNTRY_MAP = {
 }
 
 def parse_7501(text):
-    # Entry number format: 101-3526528-9
+    # Entry number: 101-3526528-9
     entry_number = grab(r'\b(\d{3}-\d{7}-\d)\b', text)
 
-    # Entry date - field 7
-    entry_date = grab(r'Entry Date\s*\n?\s*(\d{2}/\d{2}/\d{4})', text)
-    if not entry_date:
-        entry_date = grab(r'ELECTED ENTRY DATE\s*\n?\s*(\d{2}/\d{2}/\d{4})', text)
+    # Entry date: last date on the data line containing the entry number
+    # Line: "101-3526528-9 01 ABI/P 05/05/26 457 8 3901 05/05/2026"
+    entry_date = grab(r'\b\d{3}-\d{7}-\d\b[^\n]+(\d{2}/\d{2}/\d{4})', text)
 
-    # Import date - field 11
-    import_date = grab(r'Import Date\s*\n?\s*(\d{2}/\d{2}/\d{4})', text)
+    # Import date + country from carrier line
+    # Line: "CMA CGM SWORDFISH (CMDU) 11 CN 05/04/2026"
+    carrier_line = re.search(r'CMA CGM[^\n]*\b([A-Z]{2})\b\s+(\d{2}/\d{2}/\d{4})', text)
+    if not carrier_line:
+        carrier_line = re.search(r'(?:Mode Of Transport|Importing Carrier)[^\n]*\n[^\n]*\b([A-Z]{2})\b\s+(\d{2}/\d{2}/\d{4})', text)
+    country_code = carrier_line.group(1) if carrier_line else ""
+    import_date  = carrier_line.group(2) if carrier_line else ""
+    country      = COUNTRY_MAP.get(country_code, country_code)
 
-    # Country of origin - field 10
-    country_code = grab(r'Country of Origin\s*\n?\s*([A-Z]{2})\b', text)
-    country = COUNTRY_MAP.get(country_code, country_code)
-
-    # Broker name - field 46
-    broker = grab(r'(KUEHNE\s*\+\s*NAGEL[^\n,]*)', text)
-    if not broker:
-        broker = grab(r'46\..*?\n([A-Z][^\n]{3,50}(?:INC|LLC|LTD|CO)\.?)', text)
+    # Broker
+    broker = grab(r'(KUEHNE\s*\+\s*NAGEL[^\n,\.]*)', text).split('\n')[0].strip()
     if not broker:
         broker = grab(r'Broker/Filer Information[^\n]*\n([^\n]+)', text)
-    broker = broker.split('\n')[0].strip()
 
-    # Broker file number - field 47
-    broker_number = grab(r'(?:Broker/Importer File Number|47\.)[^\n]*\n?\s*([A-Z]{3}\d+)', text)
-    if not broker_number:
-        broker_number = grab(r'BROKERAGE(?:\s+NUMBER)?\s*\n\s*([A-Z]{3}\d+)', text)
+    # Broker file number: BUSxxxxxxx
+    broker_number = grab(r'\b(BUS\d+)\b', text)
 
     # Invoice number
     invoice = grab(r'Invoice\s+Number\s+(\S+)', text)
-    if not invoice:
-        invoice = grab(r'Invoice[:\s#]+([A-Z0-9/\-]+)', text)
 
-    # Supplier - from Parts Work Sheet
-    supplier = grab(r'SUPPLIER\s*\n([^\n]+)', text)
-    if not supplier:
-        supplier = grab(r'MANUFACTURER\s*\n([^\n]+)', text)
+    # Supplier: "MANUFACTURER SUPPLIER\nNINGBO LONGYUAN CO NINGBO LONGYUAN CO"
+    sup_match = re.search(r'MANUFACTURER\s+SUPPLIER\s*\n([^\n]+)', text)
+    if sup_match:
+        # Name appears twice - just take the first occurrence
+        raw = sup_match.group(1).strip()
+        half = len(raw) // 2
+        supplier = raw[:half].strip() if raw[:half].strip() == raw[half:].strip() else raw.split('  ')[0].strip()
+    else:
+        supplier = grab(r'SUPPLIER\s*\n([^\n]+)', text)
+
+    # Part number: E1060047602A0 format
+    part_match = re.search(r'\b(E\d{10}[A-Z0-9]\d)\b', text)
+    part_number = part_match.group(1) if part_match else ""
+
+    # Quantity: "3200 NO"
+    quantity = grab(r'\b(\d{3,5})\s+NO\b', text)
+
+    # Invoice value
+    inv_value = grab(r'Invoice Value USD\s+([\d,]+\.?\d*)', text)
 
     # Total entered value
-    total_value = grab(r'Total Entered Value[^\d]*(\d[\d,]+\.\d{2})', text)
-    if not total_value:
-        total_value = grab(r'Invoice Value USD\s+([\d,]+\.?\d*)', text)
+    total_value_str = grab(r'Total Entered Value \(Invoice\)\s+([\d,]+\.?\d*)', text)
     try:
-        total_value_float = float(total_value.replace(',', ''))
+        total_value_float = float(total_value_str.replace(',', ''))
     except:
         total_value_float = 0.0
 
-    # Total duty
-    total_duty = grab(r'44\.\s*Total\s*\n?\s*([\d,]+\.\d{2})', text)
-    if not total_duty:
-        total_duty = grab(r'Ascertained Total\s*\n?\s*([\d,]+\.\d{2})', text)
+    # Total duty: appears as "Total Other Fees 12670.50" (this is the duty subtotal)
+    total_duty_str = grab(r'Total Other Fees\s+([\d,]+\.\d{2})', text)
     try:
-        total_duty_float = float(total_duty.replace(',', ''))
+        total_duty_float = float(total_duty_str.replace(',', ''))
     except:
         total_duty_float = 0.0
 
-    # Part number - from Parts Work Sheet product code
-    part_number = grab(r'Product Code\s*\n.*?([A-Z0-9]{8,}(?:[A-Z0-9])?)\s', text)
-    if not part_number:
-        part_number = grab(r'([A-Z]\d{10}[A-Z0-9]\d)', text)
-
-    # Description of merchandise
-    description = grab(r'(?:DESCRIPTION OF GOODS|Description of Merchandise)[^\n]*\n([^\n]+)', text)
-    if not description:
-        description = grab(r'20\.\s*DESCRIPTION OF MERCHANDISE\s*\n([^\n]+)', text)
-
-    # Quantity
-    quantity = grab(r'Invoice Qty\s+UQ.*?\n.*?(\d+)\s+NO', text)
-    if not quantity:
-        quantity = grab(r'(\d+)\s+(?:NO|CT|KG|PCS)\b', text)
-
-    # Price / invoice value
-    inv_value = grab(r'Invoice\s+(?:Value\s+USD|Price).*?([\d,]+\.?\d*)\s+USD', text)
-
-    # Tariff lines - only keep rate >= 1%, skip Free
     tariff_lines = parse_tariff_lines(text, total_value_float)
 
     return {
-        "entry_number":      entry_number,
-        "entry_date":        entry_date,
-        "import_date":       import_date,
-        "broker":            broker,
-        "broker_number":     broker_number,
-        "supplier":          supplier,
-        "country":           country,
-        "invoice":           invoice,
-        "part_number":       part_number,
-        "description":       description,
-        "quantity":          quantity,
-        "invoice_value":     inv_value,
-        "total_value":       total_value_float,
-        "total_duty":        total_duty_float,
-        "tariff_lines":      tariff_lines,
+        "entry_number":  entry_number,
+        "entry_date":    entry_date,
+        "import_date":   import_date,
+        "broker":        broker,
+        "broker_number": broker_number,
+        "supplier":      supplier,
+        "country":       country,
+        "invoice":       invoice,
+        "part_number":   part_number,
+        "quantity":      quantity,
+        "invoice_value": inv_value,
+        "total_value":   total_value_float,
+        "total_duty":    total_duty_float,
+        "tariff_lines":  tariff_lines,
     }
 
 def parse_tariff_lines(text, entered_value):
     """
-    Extract tariff lines from 7501. Only keep lines where rate >= 1%.
-    Skip Free, MPF (499), HMF (501), and anything < 1%.
-    Each line: {hts, entered_value, rate_pct, duty_amount}
+    Real format from PDF (per line):
+      9903.88.01 4473 KG 0 25% 6,335.25   -> keep
+      9903.03.06 0.00 0 Free 0.00          -> skip (Free, duty=0)
+      9903.82.09 0.00 0 25% 6,335.25       -> keep
+      8481.90.9060 3985.00 KG 25,341 Free 0.00 -> skip (Free)
     """
     lines = []
-    # Pattern: HTS number followed by entered value, rate, duty
-    # e.g. "9903.88.01  4473 KG  0  25%  6,335.25"
-    # or   "8481.90.9060  3985.00  25,341  Free  0.00"
-    pattern = re.finditer(
-        r'\b(\d{4}\.\d{2}\.\d{4})\b[^\n]*?([\d,]+\.?\d*)\s+(?:[A-Z%]+\s+)?([\d]+(?:\.\d+)?)\s*%[^\n]*([\d,]+\.\d{2})',
-        text, re.IGNORECASE
-    )
-    for m in pattern:
-        hts      = m.group(1)
-        rate_str = m.group(3)
-        duty_str = m.group(4)
-        try:
-            rate = float(rate_str)
-            duty = float(duty_str.replace(',', ''))
-        except:
+    seen = set()
+
+    for m in re.finditer(
+        r'([0-9]{4}\.[0-9]{2}\.[0-9]{2,4})\s+.*?([0-9]+(?:\.[0-9]+)?)\s*%\s+([0-9,]+\.[0-9]{2})',
+        text, re.ASCII
+    ):
+        hts  = m.group(1)
+        rate = float(m.group(2))
+        duty = float(m.group(3).replace(',', ''))
+
+        if rate < 1.0 or duty == 0.0 or hts in seen:
             continue
-        # Skip MPF/HMF fee lines, free lines, and < 1%
-        if rate < 1.0:
-            continue
-        if duty == 0.0:
-            continue
-        # Try to get the entered value for this specific line
-        # Use the total entered value as fallback
+        seen.add(hts)
+
+        # Try to extract entered value from the specific HTS line
         ev = entered_value
         ev_match = re.search(
-            re.escape(hts) + r'[^\n]*?([\d,]+\.?\d*)\s+(?:Free|\d+\s*%)',
-            text, re.IGNORECASE
+            re.escape(hts) + r'\s+([0-9,]+\.?[0-9]*)\s+\w+\s+([0-9,]+\.?[0-9]*)\s+[0-9]+\s*%',
+            text, re.ASCII
         )
         if ev_match:
             try:
-                ev = float(ev_match.group(1).replace(',', ''))
+                candidate = float(ev_match.group(2).replace(',', ''))
+                if candidate > 0:
+                    ev = candidate
             except:
-                ev = entered_value
+                pass
 
         lines.append({
             "hts":           hts,
@@ -285,14 +266,12 @@ with tab1:
 
     st.markdown("---")
     st.subheader("Merchandise")
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3 = st.columns(3)
     with m1:
         part_number   = st.text_input("Part Number",         value=d.get("part_number", ""))
     with m2:
-        description   = st.text_input("Description",         value=d.get("description", ""))
-    with m3:
         quantity      = st.text_input("Quantity",            value=d.get("quantity", ""))
-    with m4:
+    with m3:
         invoice_value = st.text_input("Invoice Value (USD)", value=d.get("invoice_value", ""))
 
     st.markdown("---")
@@ -363,7 +342,6 @@ with tab1:
                     "country":        country,
                     "invoice":        invoice,
                     "part_number":    part_number,
-                    "description":    description,
                     "quantity":       quantity,
                     "invoice_value":  invoice_value,
                     "total_value":    tv_input,
@@ -488,7 +466,6 @@ with tab2:
                 h3.markdown(f"**Supplier:** {e.get('supplier')}")
                 h3.markdown(f"**Country:** {e.get('country')}")
                 h3.markdown(f"**Part #:** {e.get('part_number')}")
-                h4.markdown(f"**Description:** {e.get('description')}")
                 h4.markdown(f"**Quantity:** {e.get('quantity')}")
                 h4.markdown(f"**Logged:** {e.get('date_logged')}")
 
