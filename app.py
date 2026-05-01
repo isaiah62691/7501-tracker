@@ -469,11 +469,11 @@ with tab2:
         # ── Delete controls ────────────────────────────────────
         st.markdown("**Select entries to delete:**")
         to_delete = []
-        for e in reversed(filtered):
+        for i, e in enumerate(reversed(filtered)):
             label = f"📄 {e['entry_number']}  |  {e.get('supplier', '')}  |  {e.get('country', '')}  |  {e.get('entry_date', '')}  |  ${e.get('total_value', 0):,.2f}  |  Duty: ${e.get('total_duty', 0):,.2f} ({e.get('eff_rate', 0):.1f}%)"
 
             col_check, col_expand = st.columns([0.05, 0.95])
-            selected = col_check.checkbox("", key=f"del_{e['entry_number']}")
+            selected = col_check.checkbox("", key=f"del_{i}_{e['entry_number']}")
             if selected:
                 to_delete.append(e["entry_number"])
 
