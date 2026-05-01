@@ -9,9 +9,9 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 
 st.set_page_config(page_title="7501 Entry Tracker", layout="wide")
-
 DATA_FILE = "entries.json"
 
+# ── Data helpers ───────────────────────────────────────────────────────────────
 def load_entries():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f:
@@ -22,46 +22,192 @@ def save_entries(entries):
     with open(DATA_FILE, "w") as f:
         json.dump(entries, f, indent=2)
 
-def extract_text(pdf_file):
+# ── PDF extraction ─────────────────────────────────────────────────────────────
+def extract_text_from_pdf(pdf_file):
     try:
         with pdfplumber.open(pdf_file) as pdf:
             return "\n".join(p.extract_text() or "" for p in pdf.pages)
     except:
         return ""
 
-def extract_field(pattern, text, default=""):
-    m = re.search(pattern, text, re.IGNORECASE)
-    return m.group(1).strip() if m else default
+def grab(pattern, text, default="", group=1):
+    m = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+    return m.group(group).strip() if m else default
+
+COUNTRY_MAP = {
+    "CN": "China", "MX": "Mexico", "BR": "Brazil", "DE": "Germany",
+    "JP": "Japan", "KR": "South Korea", "IN": "India", "TW": "Taiwan",
+    "CA": "Canada", "GB": "United Kingdom", "FR": "France", "IT": "Italy",
+    "VN": "Vietnam", "TH": "Thailand", "MY": "Malaysia", "PH": "Philippines",
+}
 
 def parse_7501(text):
+    # Entry number format: 101-3526528-9
+    entry_number = grab(r'\b(\d{3}-\d{7}-\d)\b', text)
+
+    # Entry date - field 7
+    entry_date = grab(r'Entry Date\s*\n?\s*(\d{2}/\d{2}/\d{4})', text)
+    if not entry_date:
+        entry_date = grab(r'ELECTED ENTRY DATE\s*\n?\s*(\d{2}/\d{2}/\d{4})', text)
+
+    # Import date - field 11
+    import_date = grab(r'Import Date\s*\n?\s*(\d{2}/\d{2}/\d{4})', text)
+
+    # Country of origin - field 10
+    country_code = grab(r'Country of Origin\s*\n?\s*([A-Z]{2})\b', text)
+    country = COUNTRY_MAP.get(country_code, country_code)
+
+    # Broker name - field 46
+    broker = grab(r'(KUEHNE\s*\+\s*NAGEL[^\n,]*)', text)
+    if not broker:
+        broker = grab(r'46\..*?\n([A-Z][^\n]{3,50}(?:INC|LLC|LTD|CO)\.?)', text)
+    if not broker:
+        broker = grab(r'Broker/Filer Information[^\n]*\n([^\n]+)', text)
+    broker = broker.split('\n')[0].strip()
+
+    # Broker file number - field 47
+    broker_number = grab(r'(?:Broker/Importer File Number|47\.)[^\n]*\n?\s*([A-Z]{3}\d+)', text)
+    if not broker_number:
+        broker_number = grab(r'BROKERAGE(?:\s+NUMBER)?\s*\n\s*([A-Z]{3}\d+)', text)
+
+    # Invoice number
+    invoice = grab(r'Invoice\s+Number\s+(\S+)', text)
+    if not invoice:
+        invoice = grab(r'Invoice[:\s#]+([A-Z0-9/\-]+)', text)
+
+    # Supplier - from Parts Work Sheet
+    supplier = grab(r'SUPPLIER\s*\n([^\n]+)', text)
+    if not supplier:
+        supplier = grab(r'MANUFACTURER\s*\n([^\n]+)', text)
+
+    # Total entered value
+    total_value = grab(r'Total Entered Value[^\d]*(\d[\d,]+\.\d{2})', text)
+    if not total_value:
+        total_value = grab(r'Invoice Value USD\s+([\d,]+\.?\d*)', text)
+    try:
+        total_value_float = float(total_value.replace(',', ''))
+    except:
+        total_value_float = 0.0
+
+    # Total duty
+    total_duty = grab(r'44\.\s*Total\s*\n?\s*([\d,]+\.\d{2})', text)
+    if not total_duty:
+        total_duty = grab(r'Ascertained Total\s*\n?\s*([\d,]+\.\d{2})', text)
+    try:
+        total_duty_float = float(total_duty.replace(',', ''))
+    except:
+        total_duty_float = 0.0
+
+    # Part number - from Parts Work Sheet product code
+    part_number = grab(r'Product Code\s*\n.*?([A-Z0-9]{8,}(?:[A-Z0-9])?)\s', text)
+    if not part_number:
+        part_number = grab(r'([A-Z]\d{10}[A-Z0-9]\d)', text)
+
+    # Description of merchandise
+    description = grab(r'(?:DESCRIPTION OF GOODS|Description of Merchandise)[^\n]*\n([^\n]+)', text)
+    if not description:
+        description = grab(r'20\.\s*DESCRIPTION OF MERCHANDISE\s*\n([^\n]+)', text)
+
+    # Quantity
+    quantity = grab(r'Invoice Qty\s+UQ.*?\n.*?(\d+)\s+NO', text)
+    if not quantity:
+        quantity = grab(r'(\d+)\s+(?:NO|CT|KG|PCS)\b', text)
+
+    # Price / invoice value
+    inv_value = grab(r'Invoice\s+(?:Value\s+USD|Price).*?([\d,]+\.?\d*)\s+USD', text)
+
+    # Tariff lines - only keep rate >= 1%, skip Free
+    tariff_lines = parse_tariff_lines(text, total_value_float)
+
     return {
-        "entry_number":  extract_field(r'entry\s*(?:no|number|#)?[\s:.]*([A-Z0-9\-]{8,20})', text),
-        "entry_date":    extract_field(r'entry\s*date[\s:.]*(\d{1,2}/\d{1,2}/\d{2,4})', text),
-        "import_date":   extract_field(r'import\s*date[\s:.]*(\d{1,2}/\d{1,2}/\d{2,4})', text),
-        "broker":        extract_field(r'broker[\s:]*([\w\s]+?)(?:\n|filer|#)', text),
-        "broker_number": extract_field(r'broker\s*(?:no|number|#)[\s:.]*([0-9\-]+)', text),
-        "supplier":      extract_field(r'(?:supplier|shipper|exporter)[\s:.]*([A-Za-z0-9\s,\.]+?)(?:\n)', text),
-        "country":       extract_field(r'country\s*of\s*origin[\s:.]*([A-Za-z\s]+?)(?:\n)', text),
-        "invoice":       extract_field(r'invoice\s*(?:no|number|#)?[\s:.]*([A-Z0-9\-]+)', text),
+        "entry_number":      entry_number,
+        "entry_date":        entry_date,
+        "import_date":       import_date,
+        "broker":            broker,
+        "broker_number":     broker_number,
+        "supplier":          supplier,
+        "country":           country,
+        "invoice":           invoice,
+        "part_number":       part_number,
+        "description":       description,
+        "quantity":          quantity,
+        "invoice_value":     inv_value,
+        "total_value":       total_value_float,
+        "total_duty":        total_duty_float,
+        "tariff_lines":      tariff_lines,
     }
 
+def parse_tariff_lines(text, entered_value):
+    """
+    Extract tariff lines from 7501. Only keep lines where rate >= 1%.
+    Skip Free, MPF (499), HMF (501), and anything < 1%.
+    Each line: {hts, entered_value, rate_pct, duty_amount}
+    """
+    lines = []
+    # Pattern: HTS number followed by entered value, rate, duty
+    # e.g. "9903.88.01  4473 KG  0  25%  6,335.25"
+    # or   "8481.90.9060  3985.00  25,341  Free  0.00"
+    pattern = re.finditer(
+        r'\b(\d{4}\.\d{2}\.\d{4})\b[^\n]*?([\d,]+\.?\d*)\s+(?:[A-Z%]+\s+)?([\d]+(?:\.\d+)?)\s*%[^\n]*([\d,]+\.\d{2})',
+        text, re.IGNORECASE
+    )
+    for m in pattern:
+        hts      = m.group(1)
+        rate_str = m.group(3)
+        duty_str = m.group(4)
+        try:
+            rate = float(rate_str)
+            duty = float(duty_str.replace(',', ''))
+        except:
+            continue
+        # Skip MPF/HMF fee lines, free lines, and < 1%
+        if rate < 1.0:
+            continue
+        if duty == 0.0:
+            continue
+        # Try to get the entered value for this specific line
+        # Use the total entered value as fallback
+        ev = entered_value
+        ev_match = re.search(
+            re.escape(hts) + r'[^\n]*?([\d,]+\.?\d*)\s+(?:Free|\d+\s*%)',
+            text, re.IGNORECASE
+        )
+        if ev_match:
+            try:
+                ev = float(ev_match.group(1).replace(',', ''))
+            except:
+                ev = entered_value
+
+        lines.append({
+            "hts":           hts,
+            "entered_value": ev,
+            "rate_pct":      rate,
+            "duty_amount":   duty,
+        })
+
+    return lines
+
+# ── Excel export ───────────────────────────────────────────────────────────────
 def build_excel(entries):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "7501 Log"
+
     hfill = PatternFill("solid", start_color="1F4E79")
     hfont = Font(name="Arial", bold=True, color="FFFFFF", size=10)
     hal   = Alignment(horizontal="center", vertical="center", wrap_text=True)
     dfont = Font(name="Arial", size=10)
+    cal   = Alignment(horizontal="center", vertical="center")
+
     headers = [
-        "Entry #", "Entry Date", "Import Date", "Broker", "Supplier Name",
-        "Country of Origin", "Broker #", "Invoice #", "Part Number", "DESC",
-        "Quantity", "Price", "Total", "Tariff 1", "Tariff 2", "Tariff 3",
-        "Rate 1 (%)", "Rate 2 (%)", "Rate 3 (%)",
-        "Duty 1 (USD)", "Duty 2 (USD)", "Duty 3 (USD)",
-        "Total Duty (USD)", "Total Duty %"
+        "Entry #", "Entry Date", "Import Date", "Broker", "Broker #",
+        "Supplier", "Country of Origin", "Invoice #", "Part Number",
+        "Description", "Quantity", "Invoice Value", "Total Entered Value",
+        "HTS Code", "Entered Value", "Rate (%)", "Duty (USD)",
+        "Total Duty (USD)", "Date Logged"
     ]
-    widths = [14,12,12,10,16,16,12,14,18,24,10,10,12,14,14,14,10,10,10,12,12,12,14,12]
+    widths = [16, 12, 12, 20, 14, 22, 16, 18, 18, 28, 10, 14, 16, 14, 14, 10, 14, 14, 16]
+
     for c, (h, w) in enumerate(zip(headers, widths), 1):
         cell = ws.cell(1, c, h)
         cell.font = hfont
@@ -69,131 +215,131 @@ def build_excel(entries):
         cell.alignment = hal
         ws.column_dimensions[cell.column_letter].width = w
     ws.row_dimensions[1].height = 30
+
     row = 2
     for e in entries:
-        for item in e.get("line_items", []):
-            total      = item.get("total", 0)
-            r1         = item.get("rate1", 0) / 100
-            r2         = item.get("rate2", 0) / 100
-            r3         = item.get("rate3", 0) / 100
-            duty1      = round(total * r1, 2)
-            duty2      = round(total * r2, 2)
-            duty3      = round(total * r3, 2)
-            total_duty = round(duty1 + duty2 + duty3, 2)
-            total_pct  = round((r1 + r2 + r3) * 100, 2)
+        tariff_lines = e.get("tariff_lines", [])
+        if not tariff_lines:
+            tariff_lines = [{"hts": "", "entered_value": "", "rate_pct": "", "duty_amount": ""}]
+
+        for t in tariff_lines:
             values = [
                 e.get("entry_number"), e.get("entry_date"), e.get("import_date"),
-                e.get("broker"), e.get("supplier"), e.get("country"),
-                e.get("broker_number"), e.get("invoice"),
-                item.get("part_number"), item.get("description"),
-                item.get("quantity"), item.get("price"), total,
-                item.get("tariff1"), item.get("tariff2"), item.get("tariff3"),
-                item.get("rate1"), item.get("rate2"), item.get("rate3"),
-                duty1, duty2, duty3, total_duty, total_pct
+                e.get("broker"), e.get("broker_number"), e.get("supplier"),
+                e.get("country"), e.get("invoice"), e.get("part_number"),
+                e.get("description"), e.get("quantity"), e.get("invoice_value"),
+                e.get("total_value"),
+                t.get("hts"), t.get("entered_value"),
+                t.get("rate_pct"), t.get("duty_amount"),
+                e.get("total_duty"), e.get("date_logged")
             ]
             for c, v in enumerate(values, 1):
                 cell = ws.cell(row, c, v)
                 cell.font = dfont
-                cell.alignment = Alignment(horizontal="center", vertical="center")
+                cell.alignment = cal
             row += 1
+
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
+
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
     return buf
 
-if "line_items" not in st.session_state:
-    st.session_state.line_items = [{}]
-if "header" not in st.session_state:
-    st.session_state.header = {}
+# ── Session state ──────────────────────────────────────────────────────────────
+if "extracted" not in st.session_state:
+    st.session_state.extracted = {}
+if "to_delete" not in st.session_state:
+    st.session_state.to_delete = []
 
+# ── UI ─────────────────────────────────────────────────────────────────────────
 st.title("📦 7501 Entry Tracker")
-
 tab1, tab2 = st.tabs(["➕ New Entry", "📋 View All Entries"])
 
+# ════════════════════════════════════════════════════════
+# TAB 1 — NEW ENTRY
+# ════════════════════════════════════════════════════════
 with tab1:
-    uploaded = st.file_uploader("Upload 7501 PDF (optional)", type="pdf")
-    extracted = {}
+    uploaded = st.file_uploader("Upload 7501 PDF", type="pdf")
+    d = {}
     if uploaded:
-        text = extract_text(uploaded)
-        extracted = parse_7501(text)
-        st.success("✅ PDF parsed — review and correct fields below.")
+        text = extract_text_from_pdf(uploaded)
+        d = parse_7501(text)
+        st.success("✅ PDF parsed — review and correct anything below before saving.")
 
-    h = extracted or st.session_state.header
     st.subheader("Entry Header")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        entry_number  = st.text_input("Entry #",          value=h.get("entry_number", ""))
-        broker        = st.text_input("Broker",            value=h.get("broker", ""))
+        entry_number  = st.text_input("Entry #",            value=d.get("entry_number", ""))
+        broker        = st.text_input("Broker",              value=d.get("broker", ""))
     with c2:
-        entry_date    = st.text_input("Entry Date",        value=h.get("entry_date", ""))
-        supplier      = st.text_input("Supplier Name",     value=h.get("supplier", ""))
+        entry_date    = st.text_input("Entry Date",          value=d.get("entry_date", ""))
+        broker_number = st.text_input("Broker #",            value=d.get("broker_number", ""))
     with c3:
-        import_date   = st.text_input("Import Date",       value=h.get("import_date", ""))
-        country       = st.text_input("Country of Origin", value=h.get("country", ""))
+        import_date   = st.text_input("Import Date",         value=d.get("import_date", ""))
+        supplier      = st.text_input("Supplier",            value=d.get("supplier", ""))
     with c4:
-        broker_number = st.text_input("Broker #",          value=h.get("broker_number", ""))
-        invoice       = st.text_input("Invoice #",         value=h.get("invoice", ""))
+        country       = st.text_input("Country of Origin",   value=d.get("country", ""))
+        invoice       = st.text_input("Invoice #",           value=d.get("invoice", ""))
 
     st.markdown("---")
-    st.subheader("Line Items")
-    st.caption("Add one row per part number.")
-
-    cols = st.columns([2, 2.5, 1, 1, 1.5, 2, 2, 2, 1, 1, 1])
-    for col, label in zip(cols, ["Part #", "Description", "Qty", "Price", "Total",
-                                   "Tariff 1", "Tariff 2", "Tariff 3",
-                                   "Rate 1%", "Rate 2%", "Rate 3%"]):
-        col.markdown(f"**{label}**")
-
-    updated_items = []
-    for i, item in enumerate(st.session_state.line_items):
-        cols = st.columns([2, 2.5, 1, 1, 1.5, 2, 2, 2, 1, 1, 1])
-        part  = cols[0].text_input("", value=item.get("part_number",""),       key=f"part_{i}", label_visibility="collapsed")
-        desc  = cols[1].text_input("", value=item.get("description",""),       key=f"desc_{i}", label_visibility="collapsed")
-        qty   = cols[2].number_input("", value=float(item.get("quantity",0)),  key=f"qty_{i}",  label_visibility="collapsed", min_value=0.0)
-        price = cols[3].number_input("", value=float(item.get("price",0)),     key=f"price_{i}",label_visibility="collapsed", min_value=0.0, format="%.2f")
-        total = qty * price
-        cols[4].markdown(f"<div style='padding-top:8px'>${total:,.2f}</div>", unsafe_allow_html=True)
-        t1    = cols[5].text_input("", value=item.get("tariff1",""),           key=f"t1_{i}",   label_visibility="collapsed")
-        t2    = cols[6].text_input("", value=item.get("tariff2",""),           key=f"t2_{i}",   label_visibility="collapsed")
-        t3    = cols[7].text_input("", value=item.get("tariff3",""),           key=f"t3_{i}",   label_visibility="collapsed")
-        r1    = cols[8].number_input("",  value=float(item.get("rate1",0)),    key=f"r1_{i}",   label_visibility="collapsed", min_value=0.0, max_value=100.0)
-        r2    = cols[9].number_input("",  value=float(item.get("rate2",0)),    key=f"r2_{i}",   label_visibility="collapsed", min_value=0.0, max_value=100.0)
-        r3    = cols[10].number_input("", value=float(item.get("rate3",0)),    key=f"r3_{i}",   label_visibility="collapsed", min_value=0.0, max_value=100.0)
-        duty1 = round(total * r1 / 100, 2)
-        duty2 = round(total * r2 / 100, 2)
-        duty3 = round(total * r3 / 100, 2)
-        td    = round(duty1 + duty2 + duty3, 2)
-        tp    = round(r1 + r2 + r3, 2)
-        updated_items.append({
-            "part_number": part, "description": desc,
-            "quantity": qty, "price": price, "total": total,
-            "tariff1": t1, "tariff2": t2, "tariff3": t3,
-            "rate1": r1, "rate2": r2, "rate3": r3,
-            "duty1": duty1, "duty2": duty2, "duty3": duty3,
-            "total_duty": td, "total_duty_pct": tp
-        })
-
-    st.session_state.line_items = updated_items
-
-    ca, cb, _ = st.columns([1, 1, 4])
-    if ca.button("➕ Add Line Item"):
-        st.session_state.line_items.append({})
-        st.rerun()
-    if cb.button("🗑 Remove Last") and len(st.session_state.line_items) > 1:
-        st.session_state.line_items.pop()
-        st.rerun()
-
-    all_total    = sum(i["total"]      for i in st.session_state.line_items)
-    all_duty     = sum(i["total_duty"] for i in st.session_state.line_items)
-    avg_duty_pct = round((all_duty / all_total * 100) if all_total else 0, 2)
+    st.subheader("Merchandise")
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        part_number   = st.text_input("Part Number",         value=d.get("part_number", ""))
+    with m2:
+        description   = st.text_input("Description",         value=d.get("description", ""))
+    with m3:
+        quantity      = st.text_input("Quantity",            value=d.get("quantity", ""))
+    with m4:
+        invoice_value = st.text_input("Invoice Value (USD)", value=d.get("invoice_value", ""))
 
     st.markdown("---")
+    st.subheader("Tariff Lines")
+    st.caption("Only lines with a duty charge ≥ 1% — no Free lines, no MPF/HMF.")
+
+    # Initialize tariff lines from extraction or blank
+    if "tariff_lines" not in st.session_state or uploaded:
+        st.session_state.tariff_lines = d.get("tariff_lines", [{}]) or [{}]
+
+    th1, th2, th3, th4 = st.columns([2.5, 2, 1.5, 2])
+    th1.markdown("**HTS Code**")
+    th2.markdown("**Entered Value ($)**")
+    th3.markdown("**Rate (%)**")
+    th4.markdown("**Duty (USD)**")
+
+    updated_tariffs = []
+    for i, t in enumerate(st.session_state.tariff_lines):
+        tc1, tc2, tc3, tc4 = st.columns([2.5, 2, 1.5, 2])
+        hts = tc1.text_input("", value=t.get("hts", ""),              key=f"hts_{i}",  label_visibility="collapsed")
+        ev  = tc2.number_input("", value=float(t.get("entered_value", 0) or 0), min_value=0.0, key=f"ev_{i}",   label_visibility="collapsed", format="%.2f")
+        rt  = tc3.number_input("", value=float(t.get("rate_pct", 0) or 0),      min_value=0.0, max_value=100.0, key=f"rt_{i}", label_visibility="collapsed", format="%.2f")
+        dy  = tc4.number_input("", value=float(t.get("duty_amount", 0) or 0),   min_value=0.0, key=f"dy_{i}",   label_visibility="collapsed", format="%.2f")
+        updated_tariffs.append({"hts": hts, "entered_value": ev, "rate_pct": rt, "duty_amount": dy})
+
+    st.session_state.tariff_lines = updated_tariffs
+
+    ba, bb, _ = st.columns([1, 1, 5])
+    if ba.button("➕ Add Tariff Line"):
+        st.session_state.tariff_lines.append({})
+        st.rerun()
+    if bb.button("🗑 Remove Last") and len(st.session_state.tariff_lines) > 1:
+        st.session_state.tariff_lines.pop()
+        st.rerun()
+
+    st.markdown("---")
+    total_value  = d.get("total_value", 0.0)
+    total_duty   = d.get("total_duty", 0.0)
+
+    tv_input = st.number_input("Total Entered Value (USD)", value=float(total_value), min_value=0.0, format="%.2f")
+    td_input = st.number_input("Total Duty (USD)",          value=float(total_duty),  min_value=0.0, format="%.2f")
+
+    eff_rate = round((td_input / tv_input * 100) if tv_input else 0, 2)
     s1, s2, s3 = st.columns(3)
-    s1.metric("Total Invoice Value", f"${all_total:,.2f}")
-    s2.metric("Total Duties",        f"${all_duty:,.2f}")
-    s3.metric("Effective Duty Rate", f"{avg_duty_pct:.2f}%")
+    s1.metric("Total Entered Value", f"${tv_input:,.2f}")
+    s2.metric("Total Duty",          f"${td_input:,.2f}")
+    s3.metric("Effective Duty Rate", f"{eff_rate:.2f}%")
 
     st.markdown("---")
     if st.button("✅ Save Entry", type="primary"):
@@ -201,62 +347,137 @@ with tab1:
             st.error("Entry number is required.")
         else:
             entries = load_entries()
-            entries.append({
-                "date_logged":   datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "entry_number":  entry_number,
-                "entry_date":    entry_date,
-                "import_date":   import_date,
-                "broker":        broker,
-                "broker_number": broker_number,
-                "supplier":      supplier,
-                "country":       country,
-                "invoice":       invoice,
-                "line_items":    st.session_state.line_items,
-                "total_value":   all_total,
-                "total_duty":    all_duty,
-                "duty_pct":      avg_duty_pct,
-                "filename":      uploaded.name if uploaded else ""
-            })
-            save_entries(entries)
-            st.session_state.line_items = [{}]
-            st.session_state.header = {}
-            st.success(f"✅ Entry {entry_number} saved with {len(updated_items)} line item(s)!")
-            st.rerun()
+            # Check for duplicate
+            existing = [e["entry_number"] for e in entries]
+            if entry_number in existing:
+                st.warning(f"Entry {entry_number} already exists in the log.")
+            else:
+                entries.append({
+                    "date_logged":    datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "entry_number":   entry_number,
+                    "entry_date":     entry_date,
+                    "import_date":    import_date,
+                    "broker":         broker,
+                    "broker_number":  broker_number,
+                    "supplier":       supplier,
+                    "country":        country,
+                    "invoice":        invoice,
+                    "part_number":    part_number,
+                    "description":    description,
+                    "quantity":       quantity,
+                    "invoice_value":  invoice_value,
+                    "total_value":    tv_input,
+                    "total_duty":     td_input,
+                    "eff_rate":       eff_rate,
+                    "tariff_lines":   [t for t in st.session_state.tariff_lines if t.get("hts")],
+                    "filename":       uploaded.name if uploaded else "",
+                })
+                save_entries(entries)
+                st.session_state.tariff_lines = [{}]
+                st.success(f"✅ Entry {entry_number} saved!")
+                st.rerun()
 
+# ════════════════════════════════════════════════════════
+# TAB 2 — VIEW ALL
+# ════════════════════════════════════════════════════════
 with tab2:
     entries = load_entries()
+
     if not entries:
         st.info("No entries logged yet.")
     else:
+        # ── Summary metrics ────────────────────────────────────
         total_entries = len(entries)
         total_value   = sum(e.get("total_value", 0) for e in entries)
         total_duty    = sum(e.get("total_duty",  0) for e in entries)
-        avg_duty_rate = round((total_duty / total_value * 100) if total_value else 0, 2)
+        avg_rate      = round((total_duty / total_value * 100) if total_value else 0, 2)
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Total Entries",       total_entries)
-        m2.metric("Total Invoice Value", f"${total_value:,.2f}")
+        m2.metric("Total Entered Value", f"${total_value:,.2f}")
         m3.metric("Total Duties Paid",   f"${total_duty:,.2f}")
-        m4.metric("Avg Duty Rate",       f"{avg_duty_rate:.2f}%")
+        m4.metric("Avg Effective Rate",  f"{avg_rate:.2f}%")
 
         st.markdown("---")
-        search = st.text_input("🔍 Search by entry #, supplier, part number, or country")
+
+        # ── Filters ────────────────────────────────────────────
+        with st.expander("🔽 Filters", expanded=True):
+            fc1, fc2, fc3 = st.columns(3)
+            with fc1:
+                search = st.text_input("🔍 Search", placeholder="Entry #, supplier, part #, HTS, country...")
+            with fc2:
+                all_brokers = sorted(set(e.get("broker", "") for e in entries if e.get("broker")))
+                broker_filter = st.multiselect("Broker", all_brokers)
+            with fc3:
+                all_countries = sorted(set(e.get("country", "") for e in entries if e.get("country")))
+                country_filter = st.multiselect("Country of Origin", all_countries)
+
+            fc4, fc5, fc6 = st.columns(3)
+            with fc4:
+                all_suppliers = sorted(set(e.get("supplier", "") for e in entries if e.get("supplier")))
+                supplier_filter = st.multiselect("Supplier", all_suppliers)
+            with fc5:
+                date_from = st.date_input("Entry Date From", value=None)
+            with fc6:
+                date_to   = st.date_input("Entry Date To",   value=None)
+
+            fc7, fc8 = st.columns(2)
+            with fc7:
+                min_duty = st.number_input("Min Total Duty ($)", value=0.0, min_value=0.0, format="%.2f")
+            with fc8:
+                max_duty = st.number_input("Max Total Duty ($)", value=0.0, min_value=0.0, format="%.2f",
+                                           help="Leave at 0 for no max")
+
+        # ── Apply filters ──────────────────────────────────────
         filtered = entries
+
         if search:
             s = search.lower()
-            filtered = [e for e in entries if
-                s in e.get("entry_number","").lower() or
-                s in e.get("supplier","").lower() or
-                s in e.get("country","").lower() or
-                any(s in i.get("part_number","").lower() or
-                    s in i.get("description","").lower()
-                    for i in e.get("line_items",[]))]
+            filtered = [e for e in filtered if
+                s in e.get("entry_number", "").lower() or
+                s in e.get("supplier", "").lower() or
+                s in e.get("country", "").lower() or
+                s in e.get("part_number", "").lower() or
+                s in e.get("description", "").lower() or
+                s in e.get("broker", "").lower() or
+                s in e.get("invoice", "").lower() or
+                any(s in t.get("hts", "").lower() for t in e.get("tariff_lines", []))]
+
+        if broker_filter:
+            filtered = [e for e in filtered if e.get("broker") in broker_filter]
+
+        if country_filter:
+            filtered = [e for e in filtered if e.get("country") in country_filter]
+
+        if supplier_filter:
+            filtered = [e for e in filtered if e.get("supplier") in supplier_filter]
+
+        if date_from:
+            filtered = [e for e in filtered if e.get("entry_date", "") >= date_from.strftime("%m/%d/%Y")]
+
+        if date_to:
+            filtered = [e for e in filtered if e.get("entry_date", "") <= date_to.strftime("%m/%d/%Y")]
+
+        if min_duty > 0:
+            filtered = [e for e in filtered if e.get("total_duty", 0) >= min_duty]
+
+        if max_duty > 0:
+            filtered = [e for e in filtered if e.get("total_duty", 0) <= max_duty]
 
         st.markdown(f"Showing **{len(filtered)}** of **{total_entries}** entries")
 
+        # ── Delete controls ────────────────────────────────────
+        st.markdown("**Select entries to delete:**")
+        to_delete = []
         for e in reversed(filtered):
-            label = f"📄 {e['entry_number']}  |  {e.get('supplier','')}  |  {e.get('entry_date','')}  |  ${e.get('total_value',0):,.2f}  |  Duty: ${e.get('total_duty',0):,.2f} ({e.get('duty_pct',0):.1f}%)"
-            with st.expander(label):
+            label = f"📄 {e['entry_number']}  |  {e.get('supplier', '')}  |  {e.get('country', '')}  |  {e.get('entry_date', '')}  |  ${e.get('total_value', 0):,.2f}  |  Duty: ${e.get('total_duty', 0):,.2f} ({e.get('eff_rate', 0):.1f}%)"
+
+            col_check, col_expand = st.columns([0.05, 0.95])
+            selected = col_check.checkbox("", key=f"del_{e['entry_number']}")
+            if selected:
+                to_delete.append(e["entry_number"])
+
+            with col_expand.expander(label):
                 h1, h2, h3, h4 = st.columns(4)
                 h1.markdown(f"**Entry #:** {e.get('entry_number')}")
                 h1.markdown(f"**Entry Date:** {e.get('entry_date')}")
@@ -266,36 +487,42 @@ with tab2:
                 h2.markdown(f"**Invoice #:** {e.get('invoice')}")
                 h3.markdown(f"**Supplier:** {e.get('supplier')}")
                 h3.markdown(f"**Country:** {e.get('country')}")
-                h4.markdown(f"**File:** {e.get('filename','—')}")
+                h3.markdown(f"**Part #:** {e.get('part_number')}")
+                h4.markdown(f"**Description:** {e.get('description')}")
+                h4.markdown(f"**Quantity:** {e.get('quantity')}")
                 h4.markdown(f"**Logged:** {e.get('date_logged')}")
 
-                st.markdown("**Line Items:**")
-                li_cols = st.columns([2,2.5,1,1,1.5,2,2,2,1,1,1,1.5,1.5,1.5,1.5,1.5])
-                for col, lbl in zip(li_cols, ["Part #","Desc","Qty","Price","Total",
-                                               "Tariff 1","Tariff 2","Tariff 3",
-                                               "R1%","R2%","R3%",
-                                               "Duty 1","Duty 2","Duty 3","Total Duty","Duty %"]):
-                    col.markdown(f"**{lbl}**")
+                tariff_lines = e.get("tariff_lines", [])
+                if tariff_lines:
+                    st.markdown("**Tariff Lines:**")
+                    tl1, tl2, tl3, tl4 = st.columns([2.5, 2, 1.5, 2])
+                    tl1.markdown("**HTS Code**")
+                    tl2.markdown("**Entered Value**")
+                    tl3.markdown("**Rate**")
+                    tl4.markdown("**Duty**")
+                    for t in tariff_lines:
+                        tl1, tl2, tl3, tl4 = st.columns([2.5, 2, 1.5, 2])
+                        tl1.write(t.get("hts", ""))
+                        tl2.write(f"${t.get('entered_value', 0):,.2f}")
+                        tl3.write(f"{t.get('rate_pct', 0):.1f}%")
+                        tl4.write(f"${t.get('duty_amount', 0):,.2f}")
 
-                for item in e.get("line_items", []):
-                    ic = st.columns([2,2.5,1,1,1.5,2,2,2,1,1,1,1.5,1.5,1.5,1.5,1.5])
-                    ic[0].write(item.get("part_number",""))
-                    ic[1].write(item.get("description",""))
-                    ic[2].write(item.get("quantity",""))
-                    ic[3].write(f"${item.get('price',0):.2f}")
-                    ic[4].write(f"${item.get('total',0):,.2f}")
-                    ic[5].write(item.get("tariff1",""))
-                    ic[6].write(item.get("tariff2",""))
-                    ic[7].write(item.get("tariff3",""))
-                    ic[8].write(f"{item.get('rate1',0)}%")
-                    ic[9].write(f"{item.get('rate2',0)}%")
-                    ic[10].write(f"{item.get('rate3',0)}%")
-                    ic[11].write(f"${item.get('duty1',0):,.2f}")
-                    ic[12].write(f"${item.get('duty2',0):,.2f}")
-                    ic[13].write(f"${item.get('duty3',0):,.2f}")
-                    ic[14].write(f"${item.get('total_duty',0):,.2f}")
-                    ic[15].write(f"{item.get('total_duty_pct',0):.1f}%")
+                st.markdown("---")
+                sv1, sv2, sv3 = st.columns(3)
+                sv1.metric("Total Entered Value", f"${e.get('total_value', 0):,.2f}")
+                sv2.metric("Total Duty",          f"${e.get('total_duty', 0):,.2f}")
+                sv3.metric("Effective Rate",       f"{e.get('eff_rate', 0):.2f}%")
 
+        # ── Delete button ──────────────────────────────────────
+        if to_delete:
+            st.warning(f"{len(to_delete)} entry/entries selected for deletion.")
+            if st.button("🗑 Delete Selected Entries", type="primary"):
+                updated = [e for e in entries if e["entry_number"] not in to_delete]
+                save_entries(updated)
+                st.success(f"Deleted {len(to_delete)} entry/entries.")
+                st.rerun()
+
+        # ── Export ─────────────────────────────────────────────
         st.markdown("---")
         if st.button("📥 Export All to Excel"):
             buf = build_excel(entries)
