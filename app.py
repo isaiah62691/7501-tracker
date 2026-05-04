@@ -143,6 +143,7 @@ def import_from_excel(file):
     except Exception as e:
         return [], [f"Could not read file: {e}"]
 
+    # Rename duplicate Tariff columns
     cols = list(df.columns)
     tariff_count = 0
     for i, c in enumerate(cols):
@@ -152,66 +153,87 @@ def import_from_excel(file):
             tariff_count += 1
     df.columns = cols
 
+    def sf(val):
+        try:
+            v = str(val).replace(',','').replace('%','').strip()
+            return float(v) if v and v != "nan" else 0.0
+        except: return 0.0
+
+    def ss(val):
+        v = str(val).strip()
+        return "" if v == "nan" else v
+
+    def fd(val):
+        v = str(val).strip()
+        if v == "nan" or not v: return ""
+        try: return pd.to_datetime(v).strftime("%m/%d/%Y")
+        except: return v
+
     existing = load_entries()
     existing_numbers = {e["entry_number"] for e in existing}
     new_entries = []
     skipped = []
 
-    for _, row in df.iterrows():
-        entry_num = str(row.get("Entry #","")).strip()
-        if not entry_num or entry_num == "nan":
-            continue
+    # Group all rows by entry number — each entry can have multiple line items
+    df["_entry"] = df["Entry #"].apply(lambda x: str(x).strip())
+    df = df[df["_entry"].notna() & (df["_entry"] != "nan") & (df["_entry"] != "")]
+
+    for entry_num, group in df.groupby("_entry", sort=False):
         if entry_num in existing_numbers:
             skipped.append(entry_num)
             continue
 
-        def sf(val):
-            try:
-                v = str(val).replace(',','').replace('%','').strip()
-                return float(v) if v and v != "nan" else 0.0
-            except: return 0.0
+        # Use first row for header fields (entry date, broker, etc.)
+        first = group.iloc[0]
 
-        def ss(val):
-            v = str(val).strip()
-            return "" if v == "nan" else v
+        # Build one line item per row in the group
+        line_items = []
+        total_value_sum = 0.0
+        total_duty_sum  = 0.0
 
-        def fd(val):
-            v = str(val).strip()
-            if v == "nan" or not v: return ""
-            try: return pd.to_datetime(v).strftime("%m/%d/%Y")
-            except: return v
+        for _, row in group.iterrows():
+            row_total = sf(row.get("Total", 0))
+            total_value_sum += row_total
+            total_duty_sum  += sf(row.get("Total Duty (USD)", 0))
 
-        tariff_lines = []
-        total_val = sf(row.get("Total", 0))
-        for tc, rc, dc in [("Tariff","Rate 1 (%)","Duty 1 (USD)"),("Tariff.1","Rate 2 (%)","Duty 2 (USD)"),("Tariff.2","Rate 3 (%)","Duty 3 (USD)")]:
-            hts  = ss(row.get(tc,""))
-            rate_raw = sf(row.get(rc, 0))
-            rate = rate_raw * 100 if rate_raw < 1 else rate_raw
-            duty = sf(row.get(dc, 0))
-            if hts and rate >= 1.0 and duty > 0:
-                tariff_lines.append({"hts":hts,"entered_value":total_val,"rate_pct":rate,"duty_amount":duty})
+            # Each row can have up to 3 tariff codes
+            for tc, rc, dc in [
+                ("Tariff",   "Rate 1 (%)", "Duty 1 (USD)"),
+                ("Tariff.1", "Rate 2 (%)", "Duty 2 (USD)"),
+                ("Tariff.2", "Rate 3 (%)", "Duty 3 (USD)"),
+            ]:
+                hts      = ss(row.get(tc, ""))
+                rate_raw = sf(row.get(rc, 0))
+                rate     = rate_raw * 100 if rate_raw < 1 else rate_raw
+                duty     = sf(row.get(dc, 0))
+                if hts and rate >= 1.0 and duty > 0:
+                    line_items.append({
+                        "hts":           hts,
+                        "part_number":   ss(row.get("Part Number", "")),
+                        "entered_value": row_total,
+                        "rate_pct":      rate,
+                        "duty_amount":   duty,
+                    })
 
-        total_duty = sf(row.get("Total Duty (USD)", 0))
-        tdp        = sf(row.get("Total Duty %", 0))
-        eff_rate   = round(tdp * 100, 2) if tdp < 1 else round(tdp, 2)
+        eff_rate = round((total_duty_sum / total_value_sum * 100) if total_value_sum else 0, 2)
 
         new_entries.append({
             "date_logged":   datetime.now().strftime("%Y-%m-%d %H:%M"),
             "entry_number":  entry_num,
-            "entry_date":    fd(row.get("Entry Date","")),
-            "import_date":   fd(row.get("Import Date","")),
-            "broker":        ss(row.get("Broker","")),
-            "broker_number": ss(row.get("Broker number","")),
-            "supplier":      ss(row.get("Supplier Name","")),
-            "country":       ss(row.get("Country of Origin","")),
-            "invoice":       ss(row.get("Invoice #","")),
-            "part_number":   ss(row.get("Part Number","")),
-            "quantity":      ss(row.get("Quantity (pcs)","")),
-            "invoice_value": ss(row.get("Price","")),
-            "total_value":   total_val,
-            "total_duty":    total_duty,
+            "entry_date":    fd(first.get("Entry Date", "")),
+            "import_date":   fd(first.get("Import Date", "")),
+            "broker":        ss(first.get("Broker", "")),
+            "broker_number": ss(first.get("Broker number", "")),
+            "supplier":      ss(first.get("Supplier Name", "")),
+            "country":       ss(first.get("Country of Origin", "")),
+            "invoice":       ss(first.get("Invoice #", "")),
+            "part_number":   ss(first.get("Part Number", "")),
+            "quantity":      ss(first.get("Quantity (pcs)", "")),
+            "invoice_value": ss(first.get("Price", "")),
+            "total_value":   total_value_sum,
+            "total_duty":    total_duty_sum,
             "eff_rate":      eff_rate,
-            "tariff_lines":  tariff_lines,
+            "tariff_lines":  line_items,
             "filename":      "imported from Excel",
         })
         existing_numbers.add(entry_num)
