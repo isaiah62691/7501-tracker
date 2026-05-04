@@ -174,7 +174,6 @@ def import_from_excel(file):
     new_entries = []
     skipped = []
 
-    # Group all rows by entry number — each entry can have multiple line items
     df["_entry"] = df["Entry #"].apply(lambda x: str(x).strip())
     df = df[df["_entry"].notna() & (df["_entry"] != "nan") & (df["_entry"] != "")]
 
@@ -183,20 +182,23 @@ def import_from_excel(file):
             skipped.append(entry_num)
             continue
 
-        # Use first row for header fields (entry date, broker, etc.)
         first = group.iloc[0]
-
-        # Build one line item per row in the group
         line_items = []
         total_value_sum = 0.0
         total_duty_sum  = 0.0
 
         for _, row in group.iterrows():
             row_total = sf(row.get("Total", 0))
+            row_duty  = sf(row.get("Total Duty (USD)", 0))
             total_value_sum += row_total
-            total_duty_sum  += sf(row.get("Total Duty (USD)", 0))
+            total_duty_sum  += row_duty
 
-            # Each row can have up to 3 tariff codes
+            part = ss(row.get("Part Number", ""))
+            qty  = ss(row.get("Quantity (pcs)", ""))
+            price = ss(row.get("Price", ""))
+
+            # Each row is its own line item with its own tariff codes
+            row_tariffs = []
             for tc, rc, dc in [
                 ("Tariff",   "Rate 1 (%)", "Duty 1 (USD)"),
                 ("Tariff.1", "Rate 2 (%)", "Duty 2 (USD)"),
@@ -207,13 +209,21 @@ def import_from_excel(file):
                 rate     = rate_raw * 100 if rate_raw < 1 else rate_raw
                 duty     = sf(row.get(dc, 0))
                 if hts and rate >= 1.0 and duty > 0:
-                    line_items.append({
-                        "hts":           hts,
-                        "part_number":   ss(row.get("Part Number", "")),
-                        "entered_value": row_total,
-                        "rate_pct":      rate,
-                        "duty_amount":   duty,
+                    row_tariffs.append({
+                        "hts":          hts,
+                        "rate_pct":     rate,
+                        "duty_amount":  duty,
                     })
+
+            # Add one line item per row — each with its own part, qty, value, tariffs
+            line_items.append({
+                "part_number":   part,
+                "quantity":      qty,
+                "price":         price,
+                "entered_value": row_total,
+                "row_duty":      row_duty,
+                "tariffs":       row_tariffs,
+            })
 
         eff_rate = round((total_duty_sum / total_value_sum * 100) if total_value_sum else 0, 2)
 
@@ -233,7 +243,8 @@ def import_from_excel(file):
             "total_value":   total_value_sum,
             "total_duty":    total_duty_sum,
             "eff_rate":      eff_rate,
-            "tariff_lines":  line_items,
+            "line_items":    line_items,
+            "tariff_lines":  [],  # kept for PDF entries compatibility
             "filename":      "imported from Excel",
         })
         existing_numbers.add(entry_num)
@@ -258,17 +269,35 @@ def build_excel(entries):
     ws.row_dimensions[1].height=30
     row=2
     for e in entries:
-        tlines = e.get("tariff_lines",[]) or [{"hts":"","entered_value":"","rate_pct":"","duty_amount":""}]
-        for t in tlines:
-            vals=[e.get("entry_number"),e.get("entry_date"),e.get("import_date"),
-                  e.get("broker"),e.get("broker_number"),e.get("supplier"),e.get("country"),
-                  e.get("invoice"),e.get("part_number"),e.get("quantity"),e.get("invoice_value"),
-                  e.get("total_value"),t.get("hts"),t.get("entered_value"),t.get("rate_pct"),
-                  t.get("duty_amount"),e.get("total_duty"),e.get("eff_rate"),e.get("date_logged")]
-            for c,v in enumerate(vals,1):
-                cell=ws.cell(row,c,v); cell.font=dfont
-                cell.alignment=Alignment(horizontal="center",vertical="center")
-            row+=1
+        line_items  = e.get("line_items",[])
+        tlines      = e.get("tariff_lines",[])
+
+        if line_items:
+            # Excel-imported entries: one row per line item, expand tariffs inline
+            for item in line_items:
+                for t in (item.get("tariffs",[]) or [{"hts":"","rate_pct":"","duty_amount":""}]):
+                    vals=[e.get("entry_number"),e.get("entry_date"),e.get("import_date"),
+                          e.get("broker"),e.get("broker_number"),e.get("supplier"),e.get("country"),
+                          e.get("invoice"),item.get("part_number"),item.get("quantity"),
+                          item.get("price"),item.get("entered_value"),
+                          t.get("hts"),item.get("entered_value"),t.get("rate_pct"),
+                          t.get("duty_amount"),e.get("total_duty"),e.get("eff_rate"),e.get("date_logged")]
+                    for c,v in enumerate(vals,1):
+                        cell=ws.cell(row,c,v); cell.font=dfont
+                        cell.alignment=Alignment(horizontal="center",vertical="center")
+                    row+=1
+        else:
+            # PDF entries: one row per tariff line
+            for t in (tlines or [{"hts":"","entered_value":"","rate_pct":"","duty_amount":""}]):
+                vals=[e.get("entry_number"),e.get("entry_date"),e.get("import_date"),
+                      e.get("broker"),e.get("broker_number"),e.get("supplier"),e.get("country"),
+                      e.get("invoice"),e.get("part_number"),e.get("quantity"),e.get("invoice_value"),
+                      e.get("total_value"),t.get("hts"),t.get("entered_value"),t.get("rate_pct"),
+                      t.get("duty_amount"),e.get("total_duty"),e.get("eff_rate"),e.get("date_logged")]
+                for c,v in enumerate(vals,1):
+                    cell=ws.cell(row,c,v); cell.font=dfont
+                    cell.alignment=Alignment(horizontal="center",vertical="center")
+                row+=1
     ws.freeze_panes="A2"; ws.auto_filter.ref=ws.dimensions
     buf=io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf
@@ -505,7 +534,27 @@ with tab3:
                 h4.markdown(f"**Logged:** {e.get('date_logged')}")
 
                 tariff_lines = e.get("tariff_lines",[])
-                if tariff_lines:
+                line_items   = e.get("line_items",[])
+
+                if line_items:
+                    st.markdown("**Line Items:**")
+                    li1,li2,li3,li4,li5 = st.columns([2,1.5,1,1.5,2.5])
+                    li1.markdown("**Part #**"); li2.markdown("**Qty**")
+                    li3.markdown("**Price**"); li4.markdown("**Total**")
+                    li5.markdown("**Tariff / Rate / Duty**")
+                    for item in line_items:
+                        li1,li2,li3,li4,li5 = st.columns([2,1.5,1,1.5,2.5])
+                        li1.write(item.get("part_number",""))
+                        li2.write(item.get("quantity",""))
+                        li3.write(f"${float(item.get('price',0) or 0):,.2f}" if item.get('price') else "—")
+                        li4.write(f"${float(item.get('entered_value',0) or 0):,.2f}")
+                        tariff_str = "  ".join(
+                            f"{t['hts']} @ {t['rate_pct']:.0f}% = ${t['duty_amount']:,.2f}"
+                            for t in item.get("tariffs",[])
+                        )
+                        li5.write(tariff_str or "—")
+
+                elif tariff_lines:
                     st.markdown("**Tariff Lines:**")
                     tl1,tl2,tl3,tl4 = st.columns([2.5,2,1.5,2])
                     tl1.markdown("**HTS Code**"); tl2.markdown("**Entered Value**")
