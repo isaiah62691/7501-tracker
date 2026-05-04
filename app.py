@@ -581,6 +581,24 @@ with tab3:
                 st.rerun()
 
         st.markdown("---")
+        col_del, _ = st.columns([1, 3])
+        with col_del:
+            if st.button("🗑 Delete ALL Entries", type="secondary"):
+                st.session_state["confirm_delete_all"] = True
+
+        if st.session_state.get("confirm_delete_all"):
+            st.error(f"⚠️ Are you sure? This will permanently delete all {total_entries} entries.")
+            cc1, cc2, _ = st.columns([1, 1, 3])
+            if cc1.button("✅ Yes, delete all"):
+                save_entries([])
+                st.session_state["confirm_delete_all"] = False
+                st.success("All entries deleted.")
+                st.rerun()
+            if cc2.button("❌ Cancel"):
+                st.session_state["confirm_delete_all"] = False
+                st.rerun()
+
+        st.markdown("---")
         if st.button("📥 Export All to Excel"):
             buf = build_excel(entries)
             st.download_button(
